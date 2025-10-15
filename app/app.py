@@ -44,8 +44,13 @@ def _human_bytes(num):
 def _health():
     try:
         r = _get("/health", timeout=5)
-        if r.ok and (r.json() or {}).get("status") == "ok":
-            return True, "ok"
+        if r.ok:
+            try:
+                j = r.json() or {}
+            except Exception:
+                j = {}
+            if j.get("status") == "ok":
+                return True, "ok"
         return False, f"HTTP {r.status_code}"
     except Exception as e:
         return False, str(e)
@@ -68,6 +73,97 @@ def _wake_server(max_wait_sec: int = 120, interval_sec: float = 2.5):
         last = msg
         time.sleep(interval_sec)
     return False, f"Não foi possível acordar em {max_wait_sec}s. Último status: {last}"
+
+def _candidates_from_upload(data: dict, uploaded_name: str) -> list[str]:
+    """
+    Gera possíveis identificadores de dataset aceitos pelo backend:
+      - filename / saved_as / path (basename)
+      - file_path (basename)
+      - relative_path (com e sem '/')
+      - uploaded_name (basename do cliente) — fica por último
+    """
+    import os as _os
+
+    cands: list[str] = []
+
+    # 1) chaves padrão
+    for key in ("filename", "saved_as"):
+        v = (data.get(key) or "").strip()
+        if v:
+            cands.append(v)
+
+    # 2) path absolutos → basename
+    for key in ("path", "file_path"):
+        v = (data.get(key) or "").strip()
+        if v:
+            cands.append(_os.path.basename(v))
+
+    # 3) relative_path → com e sem barra inicial
+    rel = (data.get("relative_path") or "").strip()
+    if rel:
+        cands.append(rel.lstrip("/"))
+        if not rel.startswith("/"):
+            cands.append("/" + rel)
+
+    # 4) por último, o nome local do arquivo enviado
+    if uploaded_name:
+        cands.append(_os.path.basename(uploaded_name))
+
+    # remove duplicados mantendo ordem
+    seen = set()
+    uniq = []
+    for c in cands:
+        if c and c not in seen:
+            uniq.append(c)
+            seen.add(c)
+    return uniq
+
+def _try_profile(candidates: list[str], show_json=False) -> tuple[bool, str | None, dict | None, str | None]:
+    """
+    Tenta gerar o perfil usando cada candidato em ordem.
+    Retorna: (ok, name_que_funcionou, json_resposta, erro_texto)
+    """
+    last_err = None
+    for name in candidates:
+        try:
+            resp = _get(f"/profile/{name}", timeout=900)
+            if resp.ok:
+                j = resp.json()
+                return True, name, j, None
+            else:
+                last_err = f"{resp.status_code} • {resp.text[:200]}"
+        except Exception as e:
+            last_err = str(e)
+    return False, None, None, last_err
+
+def _try_profile_show(candidates: list[str]) -> tuple[bool, str | None, dict | None, str | None]:
+    last_err = None
+    for name in candidates:
+        try:
+            resp = _get(f"/profile/show/{name}", timeout=120)
+            if resp.ok:
+                j = resp.json()
+                return True, name, j, None
+            else:
+                last_err = f"{resp.status_code} • {resp.text[:200]}"
+        except Exception as e:
+            last_err = str(e)
+    return False, None, None, last_err
+
+def _try_agent_ask(candidates: list[str], question: str) -> tuple[bool, str | None, dict | None, str | None]:
+    last_err = None
+    for name in candidates:
+        try:
+            payload = {"dataset": name, "question": question}
+            resp = _post_json("/agent/ask", payload, timeout=300)
+            if resp.ok:
+                j = resp.json()
+                return True, name, j, None
+            else:
+                last_err = f"{resp.status_code} • {resp.text[:200]}"
+        except Exception as e:
+            last_err = str(e)
+    return False, None, None, last_err
 
 # ==============================
 # Header
@@ -111,7 +207,8 @@ with st.sidebar:
 # ==============================
 # Session state
 # ==============================
-st.session_state.setdefault("dataset_name", None)
+st.session_state.setdefault("dataset_name", None)          # nome que funcionou por último
+st.session_state.setdefault("dataset_candidates", [])      # candidatos vindos do upload
 st.session_state.setdefault("last_answer", None)
 st.session_state.setdefault("last_details", None)
 st.session_state.setdefault("last_question", None)
@@ -142,20 +239,17 @@ if uploaded is not None:
                 st.success("Upload concluído.")
                 st.code(json.dumps(data, indent=2, ensure_ascii=False), language="json")
 
-                # ✅ Nome do dataset EXATAMENTE como retornado pelo backend
-                fname = (
-                    data.get("filename")
-                    or data.get("saved_as")
-                    or (os.path.basename(data.get("path")) if isinstance(data.get("path"), str) else None)
-                )
-                fname = (fname or "").strip()
-
-                if not fname:
-                    st.error("O backend não retornou o nome salvo (filename). Sem ele não é possível gerar o perfil.")
+                # 🔧 gera candidatos a nome reconhecido pelo backend
+                cands = _candidates_from_upload(data, uploaded.name)
+                if not cands:
+                    st.error("O backend não retornou informações suficientes (filename/relative_path/file_path).")
                     st.stop()
-                else:
-                    st.session_state.dataset_name = fname
-                    st.info(f"Dataset definido: `{st.session_state.dataset_name}`")
+
+                st.session_state.dataset_candidates = cands
+                # não assumimos ainda qual funciona; apenas mostramos o primeiro como sugestão
+                st.session_state.dataset_name = cands[0]
+                st.info(f"Possíveis nomes do dataset: {cands}")
+                st.success(f"Dataset sugerido: `{st.session_state.dataset_name}`")
             else:
                 st.error(f"Falha no upload: {resp.status_code}")
                 st.code(resp.text, language="text")
@@ -164,9 +258,9 @@ if uploaded is not None:
 # 2) Perfil Global
 # ==============================
 st.subheader("2) Gerar / Ver Perfil Global")
-st.caption(f"Dataset atual: {st.session_state.get('dataset_name') or '—'}")
+st.caption(f"Dataset atual/sugerido: {st.session_state.get('dataset_name') or '—'}")
 
-if not st.session_state.dataset_name:
+if not (st.session_state.dataset_name or st.session_state.dataset_candidates):
     st.info("Envie seu CSV primeiro.")
 else:
     c1, c2 = st.columns([1, 1])
@@ -177,14 +271,17 @@ else:
             if not backend_ok:
                 st.warning("O backend parece offline. Clique em 'Acordar servidor' e tente de novo.")
             else:
-                with st.spinner("Calculando perfil global em chunks…"):
-                    resp = _get(f"/profile/{st.session_state.dataset_name}", timeout=900)
-                if resp.ok:
-                    out = resp.json()
-                    st.success("Perfil (re)gerado com sucesso.")
+                with st.spinner("Tentando gerar perfil (testando nomes possíveis)…"):
+                    ok, used, out, err = _try_profile(st.session_state.dataset_candidates or [st.session_state.dataset_name])
+                if ok:
+                    st.session_state.dataset_name = used  # fixa o que funcionou
+                    st.success(f"Perfil (re)gerado com sucesso usando `{used}`.")
                     st.code(json.dumps(out, indent=2, ensure_ascii=False))
                 else:
-                    st.error(f"Erro ao gerar perfil: {resp.status_code} • {resp.text}")
+                    st.error("Não consegui gerar o perfil com os nomes candidatos.")
+                    if err:
+                        st.code(str(err), language="text")
+                    st.info(f"Candidatos testados: {st.session_state.dataset_candidates}")
 
     with c2:
         st.markdown("**Abrir perfil salvo (JSON)**")
@@ -192,23 +289,23 @@ else:
             if not backend_ok:
                 st.warning("O backend parece offline. Clique em 'Acordar servidor' e tente de novo.")
             else:
-                with st.spinner("Carregando perfil salvo…"):
-                    resp = _get(f"/profile/show/{st.session_state.dataset_name}")
-                if resp.ok:
-                    saved = resp.json()
-                    st.success("Perfil carregado.")
+                with st.spinner("Tentando abrir perfil salvo…"):
+                    ok, used, saved, err = _try_profile_show(st.session_state.dataset_candidates or [st.session_state.dataset_name])
+                if ok:
+                    st.session_state.dataset_name = used
+                    st.success(f"Perfil carregado usando `{used}`.")
                     st.code(json.dumps(saved, indent=2, ensure_ascii=False))
                 else:
-                    if resp.status_code == 404:
-                        st.warning("Perfil ainda não foi gerado. Clique em **Gerar perfil global**.")
-                    else:
-                        st.error(f"Erro ao abrir perfil: {resp.status_code} • {resp.text}")
+                    st.error("Não consegui abrir o perfil salvo com os nomes candidatos.")
+                    if err:
+                        st.code(str(err), language="text")
+                    st.info(f"Candidatos testados: {st.session_state.dataset_candidates}")
 
 # ==============================
 # 3) Pergunte ao agente
 # ==============================
 st.subheader("3) Pergunte ao agente")
-if not st.session_state.dataset_name:
+if not (st.session_state.dataset_name or st.session_state.dataset_candidates):
     st.info("Envie o CSV e gere o perfil antes de perguntar.")
 else:
     default_q = "Explique o valor médio de Amount e a taxa de fraude; indique que gráfico eu deveria ver."
@@ -220,17 +317,19 @@ else:
             if not backend_ok:
                 st.warning("O backend parece offline. Clique em 'Acordar servidor' e tente novamente.")
             else:
-                st.session_state.last_question = question
-                payload = {"dataset": st.session_state.dataset_name, "question": question}
-                with st.spinner("Consultando o agente…"):
-                    resp = _post_json("/agent/ask", payload, timeout=300)
-                if resp.ok:
-                    ans = resp.json()
+                with st.spinner("Consultando o agente (testando nomes possíveis)…"):
+                    ok, used, ans, err = _try_agent_ask(st.session_state.dataset_candidates or [st.session_state.dataset_name], question)
+                if ok and isinstance(ans, dict):
+                    st.session_state.dataset_name = used
+                    st.session_state.last_question = question
                     st.session_state.last_answer = ans.get("answer")
                     st.session_state.last_details = ans.get("details")
-                    st.success("Resposta recebida.")
+                    st.success(f"Resposta recebida usando `{used}`.")
                 else:
-                    st.error(f"Erro: {resp.status_code} • {resp.text}")
+                    st.error("Não consegui consultar o agente com os nomes candidatos.")
+                    if err:
+                        st.code(str(err), language="text")
+                    st.info(f"Candidatos testados: {st.session_state.dataset_candidates}")
 
     with tip_col:
         st.caption("Peça: 'histograma de Amount (log)', 'heatmap de correlação', 'boxplot Amount por Class', 'série temporal', 'scatter V1 vs V2'…")
