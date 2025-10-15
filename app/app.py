@@ -134,7 +134,6 @@ if uploaded is not None:
                 resp = _upload_csv(uploaded)
 
             if resp.ok:
-                # Tenta ler JSON
                 try:
                     data = resp.json()
                 except Exception:
@@ -143,17 +142,17 @@ if uploaded is not None:
                 st.success("Upload concluído.")
                 st.code(json.dumps(data, indent=2, ensure_ascii=False), language="json")
 
-                # Fallbacks para descobrir nome do arquivo salvo
+                # ✅ Nome do dataset EXATAMENTE como retornado pelo backend
                 fname = (
                     data.get("filename")
                     or data.get("saved_as")
                     or (os.path.basename(data.get("path")) if isinstance(data.get("path"), str) else None)
-                    or uploaded.name
                 )
                 fname = (fname or "").strip()
 
                 if not fname:
-                    st.error("Não foi possível determinar o nome do dataset salvo.")
+                    st.error("O backend não retornou o nome salvo (filename). Sem ele não é possível gerar o perfil.")
+                    st.stop()
                 else:
                     st.session_state.dataset_name = fname
                     st.info(f"Dataset definido: `{st.session_state.dataset_name}`")
