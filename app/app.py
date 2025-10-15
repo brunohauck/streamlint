@@ -33,7 +33,6 @@ def _post_json(path: str, payload: dict, timeout=300):
 
 def _upload_csv(file):
     files = {"file": (file.name, file, "text/csv")}
-    # tempo maior por causa de arquivos grandes
     return requests.post(f"{API_URL}/upload/", files=files, timeout=1200)
 
 def _human_bytes(num):
@@ -82,6 +81,7 @@ st.markdown(
 """,
     unsafe_allow_html=True
 )
+
 left, right = st.columns([1, 6])
 with left:
     if st.button("🚀 Acordar servidor"):
@@ -132,17 +132,41 @@ if uploaded is not None:
         else:
             with st.spinner("Enviando arquivo…"):
                 resp = _upload_csv(uploaded)
+
             if resp.ok:
-                data = resp.json()
-                st.success(f"Upload concluído: `{data.get('filename')}`")
-                st.session_state.dataset_name = data.get("filename")
+                # Tenta ler JSON
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = {"_raw_text": resp.text}
+
+                st.success("Upload concluído.")
+                st.code(json.dumps(data, indent=2, ensure_ascii=False), language="json")
+
+                # Fallbacks para descobrir nome do arquivo salvo
+                fname = (
+                    data.get("filename")
+                    or data.get("saved_as")
+                    or (os.path.basename(data.get("path")) if isinstance(data.get("path"), str) else None)
+                    or uploaded.name
+                )
+                fname = (fname or "").strip()
+
+                if not fname:
+                    st.error("Não foi possível determinar o nome do dataset salvo.")
+                else:
+                    st.session_state.dataset_name = fname
+                    st.info(f"Dataset definido: `{st.session_state.dataset_name}`")
             else:
-                st.error(f"Falha no upload: {resp.status_code} • {resp.text}")
+                st.error(f"Falha no upload: {resp.status_code}")
+                st.code(resp.text, language="text")
 
 # ==============================
 # 2) Perfil Global
 # ==============================
 st.subheader("2) Gerar / Ver Perfil Global")
+st.caption(f"Dataset atual: {st.session_state.get('dataset_name') or '—'}")
+
 if not st.session_state.dataset_name:
     st.info("Envie seu CSV primeiro.")
 else:
@@ -208,15 +232,14 @@ else:
                     st.success("Resposta recebida.")
                 else:
                     st.error(f"Erro: {resp.status_code} • {resp.text}")
+
     with tip_col:
         st.caption("Peça: 'histograma de Amount (log)', 'heatmap de correlação', 'boxplot Amount por Class', 'série temporal', 'scatter V1 vs V2'…")
 
-    # Resposta
     if st.session_state.last_answer:
         st.markdown("#### Resposta")
         st.write(st.session_state.last_answer)
 
-    # Gráfico principal
     if st.session_state.last_details and isinstance(st.session_state.last_details, dict):
         url_rel = st.session_state.last_details.get("plot_url")
         url_abs = _abs_url(API_URL, url_rel) if url_rel else None
@@ -230,7 +253,6 @@ else:
                 except Exception:
                     pass
 
-    # Múltiplos gráficos
     if st.session_state.last_details and isinstance(st.session_state.last_details, dict):
         many = st.session_state.last_details.get("plot_paths")
         if many and isinstance(many, list) and len(many) > 0:
